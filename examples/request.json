@@ -1,0 +1,29 @@
+{
+  "element": {"tag": "p", "id": "intro", "classes": ["text"], "attributes": {"data-role": "lead"}},
+  "ancestors": [
+    {"tag": "html"},
+    {"tag": "body", "classes": ["dark"]},
+    {"tag": "div", "id": "app"}
+  ],
+  "layers": ["reset", "base", "components"],
+  "rules": [
+    {"origin": "ua", "selector": "p", "declarations": [
+      {"property": "color", "value": "black"},
+      {"property": "margin", "value": "1em 0"}
+    ]},
+    {"origin": "author", "layer": "reset", "selector": "p", "declarations": [
+      {"property": "margin", "value": "0"}
+    ]},
+    {"origin": "author", "layer": "base", "selector": "div p", "declarations": [
+      {"property": "color", "value": "blue"},
+      {"property": "--gap", "value": "8px"}
+    ]},
+    {"origin": "author", "selector": "#app > p.text", "declarations": [
+      {"property": "color", "value": "red"},
+      {"property": "padding", "value": "var(--gap, 4px)"}
+    ]},
+    {"origin": "author", "layer": "components", "selector": "p[data-role=lead]", "declarations": [
+      {"property": "color", "value": "green", "important": true}
+    ]}
+  ]
+}

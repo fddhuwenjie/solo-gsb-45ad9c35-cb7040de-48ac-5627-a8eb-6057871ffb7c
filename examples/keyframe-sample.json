@@ -1,0 +1,14 @@
+{
+  "keyframes": [
+    {"offset": 0, "value": "0px"},
+    {"offset": 0.5, "value": "100px"},
+    {"offset": 1, "value": "200px"}
+  ],
+  "duration": 1000,
+  "delay": 200,
+  "iteration_count": 2,
+  "direction": "alternate",
+  "fill_mode": "both",
+  "easing": "cubic-bezier(0.42, 0, 0.58, 1)",
+  "time": 700
+}

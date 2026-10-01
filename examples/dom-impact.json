@@ -1,0 +1,47 @@
+{
+  "root": {
+    "id": "app",
+    "tag": "div",
+    "classes": ["dark"],
+    "attributes": {"data-theme": "dark"},
+    "children": [
+      {"id": "title", "tag": "h1", "children": []},
+      {
+        "id": "lead",
+        "tag": "p",
+        "classes": ["text"],
+        "attributes": {"data-role": "lead"},
+        "children": [
+          {"id": "code", "tag": "code", "children": []}
+        ]
+      }
+    ]
+  },
+  "layers": ["reset", "base"],
+  "rules": [
+    {"origin": "author", "layer": "reset", "selector": "*", "declarations": [
+      {"property": "margin", "value": "0"}
+    ]},
+    {"origin": "author", "layer": "base", "selector": "div", "declarations": [
+      {"property": "--gap", "value": "8px"},
+      {"property": "--accent", "value": "red"}
+    ]},
+    {"origin": "author", "selector": "div.dark", "declarations": [
+      {"property": "--gap", "value": "12px"}
+    ]},
+    {"origin": "author", "layer": "base", "selector": "p.text", "declarations": [
+      {"property": "color", "value": "var(--accent)"},
+      {"property": "padding", "value": "var(--gap, 4px)"}
+    ]},
+    {"origin": "author", "selector": "p[data-role=lead]", "declarations": [
+      {"property": "font-weight", "value": "bold"}
+    ]},
+    {"origin": "author", "selector": "h1", "declarations": [
+      {"property": "font-size", "value": "2em"}
+    ]},
+    {"origin": "author", "selector": "code", "declarations": [
+      {"property": "color", "value": "var(--gap)"}
+    ]}
+  ],
+  "mutation": {"type": "remove_class", "node_id": "app", "class_name": "dark"}
+}

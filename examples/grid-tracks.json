@@ -1,0 +1,9 @@
+{
+  "container_width": 1000,
+  "gap": 10,
+  "columns": ["100px", "minmax(0px, 120px)", "minmax(0px, 1fr)", "1fr"],
+  "items": [
+    {"name": "hero", "start": 3, "span": 2, "min_content": 300},
+    {"name": "tag", "start": 2, "span": 1, "min_content": 80}
+  ]
+}

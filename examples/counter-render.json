@@ -1,0 +1,52 @@
+{
+  "root": {
+    "id": "book",
+    "counter_reset": [{"op": "reset", "name": "chapter"}],
+    "content": ["Book counters demo"],
+    "children": [
+      {
+        "id": "ch1",
+        "counter_increment": [{"op": "increment", "name": "chapter"}],
+        "content": [
+          {"kind": "counter", "name": "chapter", "style": "upper-alpha"},
+          ". First chapter"
+        ],
+        "children": [
+          {
+            "id": "ch1-sec-reset",
+            "counter_reset": [{"op": "reset", "name": "section"}],
+            "children": [
+              {
+                "id": "ch1-s1",
+                "counter_increment": [{"op": "increment", "name": "section"}],
+                "content": [
+                  {"kind": "counters", "name": "chapter", "separator": "."},
+                  ".",
+                  {"kind": "counters", "name": "section", "separator": ".", "style": "decimal-leading-zero"},
+                  " intro"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "note",
+        "counter_set": [{"op": "set", "name": "footnote", "value": 4}],
+        "content": [
+          "footnote ",
+          {"kind": "counter", "name": "footnote", "style": "lower-alpha"}
+        ],
+        "children": [
+          {
+            "id": "note-kid",
+            "content": [
+              "still inside footnote subtree: ",
+              {"kind": "counter", "name": "footnote", "style": "upper-latin"}
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

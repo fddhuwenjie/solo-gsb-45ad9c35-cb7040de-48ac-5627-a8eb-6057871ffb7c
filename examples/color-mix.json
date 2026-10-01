@@ -1,0 +1,7 @@
+{
+  "color_a": "hsl(240 100% 50% / 0.5)",
+  "color_b": "#ff000080",
+  "weight_a": 60,
+  "interpolation_space": "oklch",
+  "hue_interpolation": "shorter"
+}

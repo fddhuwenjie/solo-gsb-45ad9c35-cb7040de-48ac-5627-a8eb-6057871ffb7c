@@ -1,0 +1,10 @@
+{
+  "expression": "calc(min(100%, 480px) / 2 + 1em)",
+  "context": {
+    "font_size": 16,
+    "root_font_size": 16,
+    "viewport_width": 1024,
+    "viewport_height": 768,
+    "percentage_basis": 800
+  }
+}
