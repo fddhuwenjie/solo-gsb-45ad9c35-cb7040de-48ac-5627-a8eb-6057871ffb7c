@@ -3,25 +3,26 @@
 给定一棵带唯一 id 的 DOM 样本树、层顺序与结构化规则，以及一次对指定节点的
 原子变更（添加 / 移除 class、设置 / 删除 attribute、修改 tag）：
 
-1. 先按现有层叠、自定义属性继承与 var() 规则对整棵树求解基线
-   （复用 /compute 与 /stylesheet-audit 同一套引擎）；
+1. 先把原树交给不可变整树内核 kernel.analyze_tree 求基线（与 /compute、
+   /stylesheet-audit、补丁预演共享同一份规则解析与节点签名）；
 2. 校验全部通过后再原子应用变更，重新求解**整棵树**；
-3. 逐节点比对普通属性与自定义属性的 (状态, 取值, 失效原因) 与层叠候选集合，
-   只列出 computed / custom_properties / invalid 实际发生变化的节点与属性，
-   并区分四类传播原因：
+3. 用 **kernel.NodeAnalysis.signature()** 的统一四元组
+   (胜出定位, 状态, 取值, 失效原因) 逐节点判变，只列出签名发生变化的
+   节点与属性，并区分四类传播原因：
      - selector_match：变更使规则选择器对该元素的命中发生变化（含祖先链
        被变更后经后代 / 子组合符传导到后代元素的情况）；
      - cascade_winner：该属性的层叠胜出声明换人（含属性消失 / 新增）；
      - inheritance：自定义属性本元素无胜出声明，变化经继承自祖先传导；
      - var_chain：胜出声明相同，取值 / 失效状态经 var() 依赖链变化。
 
-目标不存在、重复 id、空操作或非法规则一律 422；所有校验在任何求解之前
-完成，校验失败不产生部分结果。
+因为胜出定位本身是签名分量，「胜出者改变但值相同」一定会列出；四个
+分量全同的节点（含未改变的失效原因）绝不列出。目标不存在、重复 id、
+空操作或非法规则一律 422；所有校验在任何求解之前完成。
 """
 from __future__ import annotations
 
 from .audit import flatten_tree, solve_tree, validate_rules
-from .engine import _parse_rules
+from .engine import parse_rules
 from .models import (
     AuditElement,
     CandidateOut,
@@ -33,9 +34,6 @@ from .models import (
     PropertyImpactOut,
     PropertyValueOut,
 )
-
-_ABSENT = ("absent", None, None)
-_MISSING = ("missing", None, None)
 
 # 原因在响应中的规范次序
 _REASON_ORDER = ("selector_match", "cascade_winner", "inheritance", "var_chain")
@@ -159,71 +157,51 @@ def apply_mutation(root: AuditElement, mutation: DomMutation) -> AuditElement:
     return new_root
 
 
-# ---------- 节点状态抽取 ----------
+# ---------- 节点状态抽取（全部取自内核 NodeAnalysis） ----------
 
 
-def _normal_states(world) -> dict[str, tuple]:
+def _normal_states(node) -> dict[str, tuple]:
     """普通属性：name -> (status, value, invalid_reason)。"""
-    reasons = {item.property: item.reason for item in world.invalid}
     return {
-        prop: (info.status, info.value, reasons.get(prop, info.reason))
-        for prop, info in world.normals.items()
+        prop: (info.status, info.value, info.reason)
+        for prop, info in node.normals.items()
     }
 
 
-def _normal_candidate_locs(world) -> dict[str, set[tuple[int, int]]]:
-    """普通属性：name -> 命中该元素的全部候选声明定位（胜出 + 落选）。"""
-    out: dict[str, set[tuple[int, int]]] = {}
-    for prop, info in world.normals.items():
-        locs = {(info.winner.rule_index, info.winner.decl_index)}
-        locs.update(
-            (e.candidate.rule_index, e.candidate.declaration_index)
-            for e in info.eliminated
-        )
-        out[prop] = locs
-    return out
+def _custom_states(node) -> dict[str, tuple]:
+    """自定义属性：name -> (status, value, invalid_reason)，含纯继承得到的。
 
-
-def _custom_states(world) -> dict[str, tuple]:
-    """自定义属性：name -> (status, value, invalid_reason)，含纯继承得到的。"""
-    notes = world.depths[-1].notes if world.depths else {}
-    out: dict[str, tuple] = {}
-    for name, (status, value) in world.element_custom.items():
-        reason = None
-        if status == "invalid":
-            reason = notes.get(name) or "继承自祖先的自定义属性已失效（循环依赖或 var() 解析失败）"
-        out[name] = (status, value, reason)
-    return out
-
-
-def _custom_candidate_locs(world) -> dict[str, set[tuple[int, int]]]:
-    """自定义属性：name -> 在目标元素本元素上参与层叠的候选声明定位。
-
-    只含本元素命中的候选（不含纯继承），用以判断选择器命中是否变化。
+    失效原因由内核沿继承链给出（循环 / var() 失败的具体原因）；内核未
+    记录原因时退回通用说明。
     """
-    out: dict[str, set[tuple[int, int]]] = {}
-    if not world.depths:
-        return out
-    for name, (winner, eliminated) in world.depths[-1].winners.items():
-        locs = {(winner.rule_index, winner.decl_index)}
-        locs.update(
-            (e.candidate.rule_index, e.candidate.declaration_index)
-            for e in eliminated
+    out: dict[str, tuple] = {}
+    for name, entry in node.custom.items():
+        reason = entry.reason or (
+            "继承自祖先的自定义属性已失效（循环依赖或 var() 解析失败）"
+            if entry.status == "invalid"
+            else None
         )
-        out[name] = locs
+        out[name] = (entry.status, entry.value, reason)
     return out
 
 
-def _winner_loc(world, prop, is_custom):
+def _winner_loc(node, prop: str, is_custom: bool):
     if is_custom:
-        pair = world.custom_winners.get(prop)
-        winner = pair[0] if pair else None
+        winner = node.custom_winner_candidate(prop)
     else:
-        info = world.normals.get(prop)
+        info = node.normals.get(prop)
         winner = info.winner if info else None
     if winner is None:
         return None
     return winner.rule_index, winner.decl_index
+
+
+def _signature_tuple(node, prop: str, is_custom: bool):
+    """内核统一签名分量 (定位, 状态, 取值, 原因)，缺失侧补哨兵。"""
+    sig = node.signature().get(prop)
+    if sig is not None:
+        return sig
+    return (None, "missing" if is_custom else "absent", None, None)
 
 
 # ---------- 原因归因 ----------
@@ -244,6 +222,9 @@ def _normal_reasons(b_locs, a_locs, b_loc, a_loc, b_state, a_state) -> list[str]
 
 
 def _custom_reasons(b_entry, a_entry, b_locs, a_locs, b_loc, a_loc, b_state, a_state) -> list[str]:
+    # b_state / a_state 为 (status, value) 元组；与统一签名同口径：
+    # 胜出声明不变时，状态翻转或取值变化（含两侧都 invalid 但失效原因不同）
+    # 都来自其 var() 依赖
     reasons: list[str] = []
     if b_locs != a_locs and b_loc != a_loc:
         reasons.append("selector_match")
@@ -271,17 +252,17 @@ def _state_phrase(status: str, value, reason) -> str:
     return f"{status} = {value!r}"
 
 
-def _value_out(world, prop: str, is_custom: bool, state: tuple | None) -> PropertyValueOut:
+def _value_out(node, prop: str, is_custom: bool, state: tuple | None) -> PropertyValueOut:
     if state is None:
         return PropertyValueOut(status="missing" if is_custom else "absent")
     status, value, reason = state
     if is_custom:
-        pair = world.custom_winners.get(prop)
-        winner: CandidateOut | None = pair[0].to_out() if pair else None
+        winner = node.custom_winner_candidate(prop)
+        winner_out: CandidateOut | None = winner.to_out() if winner else None
     else:
-        info = world.normals.get(prop)
-        winner = info.winner.to_out() if info else None
-    return PropertyValueOut(status=status, value=value, reason=reason, winner=winner)
+        info = node.normals.get(prop)
+        winner_out = info.winner.to_out() if info else None
+    return PropertyValueOut(status=status, value=value, reason=reason, winner=winner_out)
 
 
 def _selector_match_sentence(reasons, b_locs, a_locs, rules) -> str | None:
@@ -368,32 +349,36 @@ def _describe(
 
 
 def _diff_property(
-    world_b,
-    world_a,
+    node_b,
+    node_a,
     prop: str,
     is_custom: bool,
     states_b,
     states_a,
-    locs_b,
-    locs_a,
     rules,
 ) -> PropertyImpactOut | None:
     b_state = states_b.get(prop)
     a_state = states_a.get(prop)
-    if is_custom:
-        b_cmp = b_state or _MISSING
-        a_cmp = a_state or _MISSING
-    else:
-        b_cmp = b_state or _ABSENT
-        a_cmp = a_state or _ABSENT
-    b_loc = _winner_loc(world_b, prop, is_custom)
-    a_loc = _winner_loc(world_a, prop, is_custom)
-    b_locs = locs_b.get(prop, set())
-    a_locs = locs_a.get(prop, set())
-    # 取值 / 状态相同但层叠胜出声明换人也算变化（区分原因需要，且与
-    # /stylesheet-audit 的签名口径一致：继任者同值仍属差异）
-    if b_cmp == a_cmp and b_loc == a_loc:
+    # 判变直接使用内核统一签名（胜出定位 + 状态 + 取值 + 失效原因）：
+    # 取值 / 状态相同但层叠胜出声明换人也算变化；四分量全同则不列出
+    b_cmp = _signature_tuple(node_b, prop, is_custom)
+    a_cmp = _signature_tuple(node_a, prop, is_custom)
+    if b_cmp == a_cmp:
         return None
+    (_b_loc, b_status, _b_value, _b_reason) = b_cmp
+    (_a_loc, a_status, _a_value, _a_reason) = a_cmp
+    b_loc = _winner_loc(node_b, prop, is_custom)
+    a_loc = _winner_loc(node_a, prop, is_custom)
+    b_locs = (
+        node_b.normal_candidate_locs(prop)
+        if not is_custom
+        else node_b.custom_candidate_locs(prop)
+    )
+    a_locs = (
+        node_a.normal_candidate_locs(prop)
+        if not is_custom
+        else node_a.custom_candidate_locs(prop)
+    )
 
     if is_custom:
         reasons = _custom_reasons(
@@ -403,15 +388,34 @@ def _diff_property(
             a_locs,
             b_loc,
             a_loc,
-            b_cmp,
-            a_cmp,
+            (b_status, _b_value),
+            (a_status, _a_value),
         )
+        # 胜出声明相同、状态与取值相同，仅失效原因不同（如循环解除后变为
+        # 引用未定义变量）：差异来自 var() 依赖链，且不属于继承传导
+        if (
+            not reasons
+            and b_loc == a_loc
+            and (b_status, _b_value) == (a_status, _a_value)
+            and _b_reason != _a_reason
+        ):
+            reasons = ["var_chain"]
     else:
-        reasons = _normal_reasons(b_locs, a_locs, b_loc, a_loc, b_cmp, a_cmp)
+        reasons = _normal_reasons(
+            b_locs, a_locs, b_loc, a_loc,
+            (b_status, _b_value), (a_status, _a_value),
+        )
+        if (
+            not reasons
+            and b_loc == a_loc
+            and (b_status, _b_value) == (a_status, _a_value)
+            and _b_reason != _a_reason
+        ):
+            reasons = ["var_chain"]
     reasons = [r for r in _REASON_ORDER if r in reasons]
 
-    before = _value_out(world_b, prop, is_custom, b_state)
-    after = _value_out(world_a, prop, is_custom, a_state)
+    before = _value_out(node_b, prop, is_custom, b_state)
+    after = _value_out(node_a, prop, is_custom, a_state)
     return PropertyImpactOut(
         property=prop,
         is_custom=is_custom,
@@ -419,29 +423,24 @@ def _diff_property(
         before=before,
         after=after,
         detail=_describe(
-            prop, is_custom, reasons, before, after, b_locs, a_locs, rules
+            prop, is_custom, reasons, before, after, set(b_locs), set(a_locs), rules
         ),
     )
 
 
-def _diff_node(world_b, world_a, rules) -> list[PropertyImpactOut]:
+def _diff_node(node_b, node_a, rules) -> list[PropertyImpactOut]:
+    """普通属性按名排序后，自定义属性按名排序（保持旧响应次序）。"""
     changes: list[PropertyImpactOut] = []
 
-    nb, na = _normal_states(world_b), _normal_states(world_a)
-    lb, la = _normal_candidate_locs(world_b), _normal_candidate_locs(world_a)
+    nb, na = _normal_states(node_b), _normal_states(node_a)
     for prop in sorted(set(nb) | set(na)):
-        change = _diff_property(
-            world_b, world_a, prop, False, nb, na, lb, la, rules
-        )
+        change = _diff_property(node_b, node_a, prop, False, nb, na, rules)
         if change is not None:
             changes.append(change)
 
-    cb, ca = _custom_states(world_b), _custom_states(world_a)
-    clb, cla = _custom_candidate_locs(world_b), _custom_candidate_locs(world_a)
+    cb, ca = _custom_states(node_b), _custom_states(node_a)
     for name in sorted(set(cb) | set(ca)):
-        change = _diff_property(
-            world_b, world_a, name, True, cb, ca, clb, cla, rules
-        )
+        change = _diff_property(node_b, node_a, name, True, cb, ca, rules)
         if change is not None:
             changes.append(change)
 
@@ -455,24 +454,24 @@ def analyze_dom_impact(req: DomImpactRequest) -> DomImpactResponse:
     # 1) 全部结构 / 语法 / 语义校验先于任何求解，失败即整体 422
     flat = flatten_tree(req.root)  # 重复 id / 空 tag 等在此抛
     validate_rules(req.rules)  # 空白 property
-    parsed = _parse_rules(req.rules)  # 选择器语法非法抛 SelectorSyntaxError
+    parsed = parse_rules(req.rules)  # 选择器语法非法抛 SelectorSyntaxError
     nodes = _collect_nodes(req.root)
     echo = validate_mutation(req.mutation, nodes)
 
-    # 2) 基线求解
-    baseline_worlds = solve_tree(flat, req.layers, req.rules, frozenset(), parsed)
+    # 2) 基线求解（不可变整树内核）
+    baseline_tree = solve_tree(flat, req.layers, req.rules, frozenset(), parsed)
 
     # 3) 原子应用变更并重新求解整棵树（不增删节点，先序下标与基线一一对应）
     new_root = apply_mutation(req.root, req.mutation)
     new_flat = flatten_tree(new_root)
-    post_worlds = solve_tree(new_flat, req.layers, req.rules, frozenset(), parsed)
+    post_tree = solve_tree(new_flat, req.layers, req.rules, frozenset(), parsed)
 
-    # 4) 逐节点比对，未受影响节点不列出
+    # 4) 逐节点用同一套内核签名比对，未受影响节点不列出
     affected: list[NodeImpactOut] = []
-    for node, world_b, world_a in zip(flat, baseline_worlds, post_worlds):
-        changes = _diff_node(world_b, world_a, req.rules)
+    for fnode, node_b, node_a in zip(flat, baseline_tree.nodes, post_tree.nodes):
+        changes = _diff_node(node_b, node_a, req.rules)
         if changes:
-            affected.append(NodeImpactOut(node_id=node.raw_id, changes=changes))
+            affected.append(NodeImpactOut(node_id=fnode.raw_id, changes=changes))
 
     return DomImpactResponse(
         nodes_checked=len(flat),

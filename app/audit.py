@@ -3,24 +3,27 @@ computed、custom_properties 或 invalid 状态的声明批次。
 
 判定方式：
 
-1. 先序展平样本树，逐节点以「根 -> ... -> 父」祖先链复用 /compute 同款
-   引擎（层叠、层顺序、自定义属性继承、循环失效、var() fallback）求解基线；
-2. 按 rule_index、declaration_index 顺序逐条把声明加入删除候选，**重新计算
-   整棵树**并逐节点比对签名——签名包含每个普通属性的 (胜出声明定位,
-   computed/invalid 状态, 取值) 与每个自定义属性的 (本元素胜出声明定位,
-   ok/invalid/missing 状态, 解析值，含纯继承)；
-3. 全树签名一致才真正纳入删除批次（贪心累积，后续试删在已删批次之上进行），
-   否则保留并记录按先序遍历找到的首个冲突节点、冲突属性与阻断原因。
+1. 先序展平样本树，交给不可变整树内核 kernel.analyze_tree 逐节点求解
+   基线——与 /compute、/dom-impact、补丁预演共享同一份规则解析与同一套
+   节点状态签名；
+2. 按 rule_index、declaration_index 顺序逐条把声明加入删除候选，重新
+   求解整棵树并逐节点比对 **kernel.NodeAnalysis.signature()** 的四元组
+   签名 (胜出声明定位, 状态, 取值, 失效原因)——普通属性与自定义属性
+   （含纯继承）用同一个签名函数；
+3. 全树签名一致才真正纳入删除批次（贪心累积，后续试删在已删批次之上
+   进行），否则保留并记录按先序遍历找到的首个冲突节点、冲突属性与原因。
 
 因此以下情况都不会被纳入批次：删除后出现新的失效（包括自定义属性循环 /
-fallback 依赖被破坏）、原本 invalid 被解除、层叠胜出者换人（即便取值恰好
-相同）、或经继承 / var() 链传导的任何取值变化。
+fallback 依赖被破坏）、原本 invalid 被解除（含失效原因变化）、层叠胜出
+者换人（即便取值恰好相同——胜出定位是签名分量）、或经继承 / var() 链
+传导的任何取值变化。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .engine import _solve, _parse_rules
+from .engine import parse_rules
+from .kernel import RuleSet, analyze_tree
 from .models import (
     AuditElement,
     DeletedDeclarationOut,
@@ -47,13 +50,13 @@ def _to_element_info(node: AuditElement) -> ElementInfo:
     )
 
 
-@dataclass
+@dataclass(frozen=True)
 class FlatNode:
     """先序展平后的一个节点及其祖先链（ElementInfo，根 -> 父）。"""
 
     raw_id: object
     element: ElementInfo
-    ancestors: list[ElementInfo]
+    ancestors: tuple[ElementInfo, ...]
 
 
 def flatten_tree(root: AuditElement) -> list[FlatNode]:
@@ -66,7 +69,7 @@ def flatten_tree(root: AuditElement) -> list[FlatNode]:
             raise AuditValidationError(f"DOM 样本树存在重复 id：{node.id!r}")
         seen.add(node.id)
         info = _to_element_info(node)
-        flat.append(FlatNode(raw_id=node.id, element=info, ancestors=list(ancestors)))
+        flat.append(FlatNode(raw_id=node.id, element=info, ancestors=tuple(ancestors)))
         child_ancestors = ancestors + [info]
         for child in node.children:
             walk(child, child_ancestors)
@@ -78,8 +81,8 @@ def flatten_tree(root: AuditElement) -> list[FlatNode]:
 def validate_rules(rules) -> None:
     """结构化规则的补充校验：声明属性名不能为空。
 
-    选择器语法由引擎解析时抛出 SelectorSyntaxError（422），层重复声明等
-    与 /compute 保持同一宽容度，不额外拒绝。
+    选择器语法由内核解析规则时抛出 SelectorSyntaxError（422），层重复
+    声明等与 /compute 保持同一宽容度，不额外拒绝。
     """
     for ri, rule in enumerate(rules):
         for di, decl in enumerate(rule.declarations):
@@ -89,95 +92,60 @@ def validate_rules(rules) -> None:
                 )
 
 
-# ---------- 整树求解与签名 ----------
+# ---------- 整树求解（统一走内核） ----------
 
 
 def solve_tree(flat: list[FlatNode], layers, rules, disabled, parsed):
-    """对展平树逐节点求解，返回 {先序下标: _World}。
+    """对展平树先序求解，返回内核 TreeAnalysis。
 
     disabled 为已纳入删除批次的 (rule_index, declaration_index) 集合；
-    parsed 为只解析一次、所有复算共享的选择器解析结果。
+    parsed 为只解析一次、所有复算共享的选择器解析结果。三个比对入口
+    （审计 / DOM 变更 / 补丁预演）的差异判定都基于 TreeAnalysis 内
+    NodeAnalysis 的同一套签名。
     """
-    worlds = []
-    for node in flat:
-        worlds.append(
-            _solve(
-                node.element,
-                node.ancestors,
-                layers,
-                rules,
-                disabled=disabled,
-                parsed=parsed,
-            )
-        )
-    return worlds
-
-
-def normal_signature(world) -> dict[str, tuple]:
-    """目标元素普通属性签名：属性 -> (胜出定位, 状态, 取值)。"""
-    return {
-        prop: ((info.winner.rule_index, info.winner.decl_index), info.status, info.value)
-        for prop, info in world.normals.items()
-    }
-
-
-def custom_signature(world) -> dict[str, tuple]:
-    """目标元素自定义属性签名（含纯继承得到的）：
-
-    name -> (本元素胜出定位或 None, 状态 ok/invalid/missing, 解析值)。
-    """
-    sig = {}
-    for name, (status, value) in world.element_custom.items():
-        winner = world.custom_winners.get(name)
-        loc = (winner[0].rule_index, winner[0].decl_index) if winner else None
-        sig[name] = (loc, status, value)
-    return sig
-
-
-def tree_signature(worlds):
-    """整棵树的结果签名：[(普通签名, 自定义签名), ...]（按先序）。"""
-    return [(normal_signature(w), custom_signature(w)) for w in worlds]
+    ruleset = RuleSet.parse(
+        rules, layers, disabled=frozenset(disabled), parsed=parsed
+    )
+    return analyze_tree(
+        [(node.raw_id, node.element, node.ancestors) for node in flat], ruleset
+    )
 
 
 # ---------- 冲突诊断 ----------
 
 
 def _first_difference(baseline_sigs, trial_sigs):
-    """返回 (先序下标, 属性名, 是否自定义属性, 基线项, 试删项)。
+    """返回 (先序下标, 属性名, 基线签名项, 试删签名项)。
 
-    属性遍历顺序：普通属性与自定义属性合并按属性名排序
-    （自定义属性以 -- 开头，与普通属性不会同名）。
+    签名项统一为 (胜出定位, 状态, 取值, 失效原因)；普通属性与自定义属性
+    合并按属性名排序（自定义属性以 -- 开头，与普通属性不会同名）。
     """
-    for index, ((b_norm, b_cust), (t_norm, t_cust)) in enumerate(
-        zip(baseline_sigs, trial_sigs)
-    ):
-        names = sorted(set(b_norm) | set(t_norm) | set(b_cust) | set(t_cust))
-        for name in names:
-            is_custom = name.startswith("--")
-            b = (b_cust if is_custom else b_norm).get(name)
-            t = (t_cust if is_custom else t_norm).get(name)
+    for index, (b_sig, t_sig) in enumerate(zip(baseline_sigs, trial_sigs)):
+        for name in sorted(set(b_sig) | set(t_sig)):
+            b = b_sig.get(name)
+            t = t_sig.get(name)
             if b != t:
-                return index, name, is_custom, b, t
+                return index, name, b, t
     return None
 
 
 def _describe_normal(prop, base, trial) -> tuple[str, str]:
-    """普通属性差异 -> (reason, 中文说明)。签名项为 (胜出定位, 状态, 取值)。"""
+    """普通属性差异 -> (reason, 中文说明)。签名项为 (胜出定位, 状态, 取值, 原因)。"""
     if base is None:
-        loc, status, value = trial
+        loc, status, value, _reason = trial
         return (
             "winner_changed",
             f"删除后 {prop} 新增了层叠胜出声明（规则 {loc[0]} 第 {loc[1]} 条），"
             f"计算值为 {value!r}；删除前该属性不存在胜出声明",
         )
     if trial is None:
-        loc, status, value = base
+        loc, status, value, _reason = base
         return (
             "winner_changed",
             f"{prop} 的胜出声明（规则 {loc[0]} 第 {loc[1]} 条，原值 {value!r}）"
             "被删除后该属性不再有任何声明胜出",
         )
-    (b_loc, b_status, b_value), (t_loc, t_status, t_value) = base, trial
+    (b_loc, b_status, b_value, _br), (t_loc, t_status, t_value, _tr) = base, trial
     if b_loc != t_loc:
         if t_loc is None:
             return (
@@ -211,10 +179,10 @@ def _describe_normal(prop, base, trial) -> tuple[str, str]:
 
 
 def _describe_custom(prop, base, trial) -> tuple[str, str]:
-    """自定义属性差异 -> (reason, 中文说明)。签名项为 (本元素胜出定位或 None,
-    状态, 解析值)；base/trial 为 None 表示该侧无此属性。"""
+    """自定义属性差异 -> (reason, 中文说明)。签名项为 (本元素胜出定位或
+    None, 状态, 解析值, 失效原因)；base/trial 为 None 表示该侧无此属性。"""
     if base is None:
-        loc, status, value = trial
+        loc, status, value, _reason = trial
         where = f"规则 {loc[0]} 第 {loc[1]} 条" if loc else "继承"
         return (
             "winner_changed",
@@ -222,14 +190,14 @@ def _describe_custom(prop, base, trial) -> tuple[str, str]:
             f"值 {value!r}）；删除前该节点链上不存在此属性",
         )
     if trial is None:
-        loc, status, value = base
+        loc, status, value, _reason = base
         where = f"规则 {loc[0]} 第 {loc[1]} 条" if loc else "继承自祖先"
         return (
             "winner_changed",
             f"自定义属性 {prop}（原来源：{where}，值 {value!r}）"
             "在删除后于该节点链上彻底消失（missing）",
         )
-    (b_loc, b_status, b_value), (t_loc, t_status, t_value) = base, trial
+    (b_loc, b_status, b_value, _br), (t_loc, t_status, t_value, _tr) = base, trial
     if b_loc != t_loc:
         b_where = (
             f"规则 {b_loc[0]} 第 {b_loc[1]} 条" if b_loc else "纯继承（本元素无胜出声明）"
@@ -287,11 +255,11 @@ def audit_stylesheet(req: StylesheetAuditRequest) -> StylesheetAuditResponse:
 
     # 选择器只解析一次：删除声明不改变选择器，非法选择器在此即抛
     # SelectorSyntaxError（由端点层转 422）
-    parsed = _parse_rules(req.rules)
+    parsed = parse_rules(req.rules)
 
     disabled: set[tuple[int, int]] = set()
-    baseline_worlds = solve_tree(flat, req.layers, req.rules, disabled, parsed)
-    baseline_sigs = tree_signature(baseline_worlds)
+    baseline_tree = solve_tree(flat, req.layers, req.rules, disabled, parsed)
+    baseline_sigs = baseline_tree.tree_signature()
 
     deleted: list[DeletedDeclarationOut] = []
     retained: list[RetainedDeclarationOut] = []
@@ -299,10 +267,10 @@ def audit_stylesheet(req: StylesheetAuditRequest) -> StylesheetAuditResponse:
     for ri, rule in enumerate(req.rules):
         for di, decl in enumerate(rule.declarations):
             trial_disabled = disabled | {(ri, di)}
-            trial_worlds = solve_tree(
+            trial_tree = solve_tree(
                 flat, req.layers, req.rules, frozenset(trial_disabled), parsed
             )
-            trial_sigs = tree_signature(trial_worlds)
+            trial_sigs = trial_tree.tree_signature()
             if trial_sigs == baseline_sigs:
                 disabled = trial_disabled
                 deleted.append(
@@ -317,8 +285,8 @@ def audit_stylesheet(req: StylesheetAuditRequest) -> StylesheetAuditResponse:
 
             diff = _first_difference(baseline_sigs, trial_sigs)
             assert diff is not None
-            index, prop, is_custom, base, trial = diff
-            if is_custom:
+            index, prop, base, trial = diff
+            if prop.startswith("--"):
                 reason, detail = _describe_custom(prop, base, trial)
             else:
                 reason, detail = _describe_normal(prop, base, trial)
