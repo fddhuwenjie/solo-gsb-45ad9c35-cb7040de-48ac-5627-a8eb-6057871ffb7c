@@ -13,8 +13,10 @@ from .models import CandidateOut, EliminatedOut
 _ORIGIN_RANK = {"ua": 0, "user": 1, "author": 2}
 
 
-@dataclass
+@dataclass(frozen=True)
 class Candidate:
+    """一条参与层叠的候选声明（不可变，整树分析内核共享）。"""
+
     selector: str
     origin: str
     layer: str | None

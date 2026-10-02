@@ -863,9 +863,13 @@ class RetainedDeclarationOut(BaseModel):
       - new_invalid：删除后原本 computed 的属性 / 自定义属性变为 invalid；
       - invalid_cleared：删除后原本 invalid 的状态被解除；
       - value_changed：胜出声明相同，但 var() / 继承链取值发生变化；
-      - status_changed：自定义属性 ok ↔ invalid 切换（胜出声明相同）。
+      - status_changed：自定义属性 ok ↔ invalid 切换（胜出声明相同）；
+      - reason_changed：胜出声明、状态与取值不变，但失效原因变化
+        （如循环依赖失效变为 var() 解析失败）。
     conflict_node 为按先序遍历找到的首个冲突节点 id；
     custom_properties / computed / invalid 三类节点状态任一变化即视为阻断。
+    判定签名与 /dom-impact、/compute 预演共享：胜出声明定位 + 状态 +
+    取值 + 失效原因。
     """
 
     rule_index: int

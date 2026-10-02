@@ -6,13 +6,13 @@ var() 递归解析并支持 fallback；处于循环依赖中的自定义属性�
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # 本模块中 lookup 均为可调用对象：lookup(name) -> (status, value)，
 # 其中 status ∈ {"ok", "missing", "invalid"}。
 
 
-@dataclass
+@dataclass(frozen=True)
 class VarEvent:
     """一次 var() 引用的解析记录（供样式变更预演构建因果轨迹）。
 
@@ -21,14 +21,14 @@ class VarEvent:
       - ref 状态 missing / invalid 且有 fallback：kind="fallback"，
         value 为递归解析后的 fallback；
       - ref 状态 missing / invalid 且无 fallback：kind="fail"，value 为 None。
-    child_events 为 fallback 内部 var() 的解析记录。
+    child_events 为 fallback 内部 var() 的解析记录（不可变元组）。
     """
 
     name: str
     ref_status: str  # ok | missing | invalid
     kind: str  # ok | fallback | fail
     value: str | None = None
-    child_events: list["VarEvent"] = field(default_factory=list)
+    child_events: tuple["VarEvent", ...] = ()
 
     def iter_all(self):
         yield self
@@ -126,7 +126,7 @@ def substitute_vars(
                             ref_status=status,
                             kind="fallback",
                             value=sub,
-                            child_events=child_events,
+                            child_events=tuple(child_events),
                         )
                     )
                 out.append(sub)

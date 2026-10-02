@@ -31,6 +31,29 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+## 整树分析内核
+
+`/compute`、`/stylesheet-audit`、`/dom-impact` 与 `/compute` 预演（patches）
+共享同一个**不可变整树分析内核**（`app/analysis.py`），不再各自维护节点
+状态签名与差异判断：
+
+- **`RuleSet`**：一次解析的规则集（选择器、特异性、源码次序、层声明顺序）。
+  审计的逐条试删、DOM 变更的基线 / 变更后、预演的基线 / 补丁后 / 留一法
+  复算，都复用同一份解析结果（补丁只改声明，经 `with_declarations` 替换
+  声明表，选择器骨架不重新解析）；
+- **`SolveOptions`**：一次求解的变体参数（审计的声明删除集合、预演的
+  声明级层覆盖），不改变已解析的规则骨架；
+- **`solve_chain` / `solve_forest`**：按先序为每个节点产出不可变的
+  **`NodeAnalysis`**——普通属性与自定义属性的层叠胜出者与全部候选定位、
+  `computed` / `custom_properties` / `invalid`（含失效原因）、自定义属性
+  沿祖先链的继承与 `var()` 依赖记录（解析事件、依赖图、循环集合）；
+- **`NodeAnalysis.signature()`**：三处前后对比（审计试删、DOM 变更、
+  补丁预演）共享的节点状态签名——每个属性记录「胜出声明定位 +
+  `computed`/`invalid`（或 `ok`/`invalid`）状态 + 取值 + 失效原因」。
+
+因此**胜出者改变但取值相同**、失效原因变化（如循环依赖失效变为 var()
+解析失败）都计为变化；完全未变的节点不会进入任何一方的结果。
+
 ## 请求示例
 
 ```bash
@@ -267,17 +290,19 @@ p 上的自定义属性 --b：【补丁后】p 上 --a ↔ --b 形成循环依�
 审计哪些声明可以**同时删除**而不改变样本树上任何节点的 `computed`、
 `custom_properties` 或 `invalid` 状态。
 
-判定过程与 `/compute` 完全同一套引擎：逐节点以「根 → … → 父」祖先链做
-选择器匹配，按来源 / 层 / important / 特异性 / 源码次序层叠，自定义属性
-沿树**继承**、检测**循环依赖**并按 **fallback** 解析 `var()`。审计按
-`rule_index`、`declaration_index` 顺序**逐条把声明加入删除候选并重新计算
-整棵树**：删除后所有节点的下列签名均与基线一致，才真正纳入批次（贪心累积，
-后续试删在已删批次之上进行）：
+判定过程与 `/compute` 完全同一套引擎（见上文「整树分析内核」）：逐节点以
+「根 → … → 父」祖先链做选择器匹配，按来源 / 层 / important / 特异性 /
+源码次序层叠，自定义属性沿树**继承**、检测**循环依赖**并按 **fallback**
+解析 `var()`。审计按 `rule_index`、`declaration_index` 顺序**逐条把声明
+加入删除候选并重新计算整棵树**：删除后所有节点的共享签名（与
+`/dom-impact`、`/compute` 预演同一份）均与基线一致，才真正纳入批次
+（贪心累积，后续试删在已删批次之上进行）：
 
 - 普通属性：胜出声明定位 `(rule_index, declaration_index)`、
-  `computed` / `invalid` 状态与取值；
+  `computed` / `invalid` 状态、取值与失效原因；
 - 自定义属性：本元素胜出声明定位（纯继承为 `null`）、
-  `ok` / `invalid` / `missing` 状态与解析值（**含只继承、本元素未声明的**）。
+  `ok` / `invalid` / `missing` 状态、解析值与失效原因
+  （**含只继承、本元素未声明的**）。
 
 因此删除后出现新的失效（变量缺失、循环形成 / 解除、fallback 改道失败）、
 原本 invalid 被解除、层叠胜出者换人（**即使继任者取值恰好相同**）、或经
@@ -339,7 +364,9 @@ p.text#lead > code#code)`。响应（节选）：
   - `reason`：阻断类别——`winner_changed`（胜出者换人或属性消失 / 新增）、
     `new_invalid`（删除后新出现失效）、`invalid_cleared`（原失效被解除）、
     `value_changed`（胜出者不变但 `var()` / 继承取值变化）、
-    `status_changed`（自定义属性 ok ↔ invalid 切换）；
+    `status_changed`（自定义属性 ok ↔ invalid 切换）、
+    `reason_changed`（胜出声明、状态与取值不变，但失效原因变化，
+    如循环依赖失效变为 `var()` 解析失败）；
   - `detail`：中文阻断说明（含基线 / 删除后的胜出定位与取值）。
 
 ### 审计校验（HTTP 422）
@@ -470,6 +497,68 @@ curl -X POST http://localhost:8000/dom-impact \
   （含从有值继承变为 `missing`）；
 - `var_chain`：胜出声明相同，但取值 / 失效状态经 `var()` 依赖链变化
   （包括 computed ↔ invalid 翻转、fallback 改道、循环依赖形成 / 解除）。
+
+### 嵌套继承示例
+
+自定义属性沿祖先链继承并可经 `var()` 逐级串联。下例 `--a` 在根上声明，
+`section` 的 `--b` 引用它，`p` 的 `margin` 再引用 `--b`；给根添加
+`hot` 类后，变化沿「层叠 → 继承 → var() 链 → 再继承」传导三层：
+
+```bash
+curl -X POST http://localhost:8000/dom-impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "root": {"id": "gp", "tag": "div", "children": [
+      {"id": "mid", "tag": "section", "children": [
+        {"id": "leaf", "tag": "p", "children": []}
+      ]}
+    ]},
+    "rules": [
+      {"selector": "div", "declarations": [{"property": "--a", "value": "2px"}]},
+      {"selector": "div.hot", "declarations": [{"property": "--a", "value": "9px"}]},
+      {"selector": "section", "declarations": [{"property": "--b", "value": "var(--a)"}]},
+      {"selector": "p", "declarations": [{"property": "margin", "value": "var(--b)"}]}
+    ],
+    "mutation": {"type": "add_class", "node_id": "gp", "class_name": "hot"}
+  }'
+```
+
+响应要点：`gp` 的 `--a` 因 `selector_match` + `cascade_winner` 由 `2px`
+变为 `9px`；`mid` 的 `--a` 标 `inheritance`、`--b` 标 `var_chain`（本元素
+有胜出声明，变化来自其 `var(--a)` 依赖）；`leaf` 的 `--b` 标
+`inheritance`、`margin` 标 `var_chain` 变为 `9px`。树中不涉及的节点
+（如无相关规则的兄弟子树）不列入 `affected_nodes`。
+
+### fallback 改道与循环解除示例
+
+```bash
+curl -X POST http://localhost:8000/dom-impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "root": {"id": "r", "tag": "div", "classes": ["on"], "children": [
+      {"id": "k", "tag": "p", "children": []}
+    ]},
+    "rules": [
+      {"selector": "div.on", "declarations": [{"property": "--x", "value": "5px"}]},
+      {"selector": "p", "declarations": [{"property": "margin", "value": "var(--x, 1px)"}]}
+    ],
+    "mutation": {"type": "remove_class", "node_id": "r", "class_name": "on"}
+  }'
+```
+
+移除 `on` 后 `--x` 从链上消失（`r` 上 `ok → missing`，原因
+`selector_match` + `cascade_winner`；`k` 上标 `inheritance`），
+`k` 的 `margin` 胜出声明不变、由主分支**改道 fallback**，标
+`var_chain`，`computed = '5px' → '1px'`。反向添加 `on` 则 fallback
+重新并回主分支（`'1px' → '5px'`）。
+
+循环解除同理：`p.c { --a: var(--b); --b: var(--a) }` 与
+`p { --a: 1px; color: var(--a, 7px) }` 下，移除 `c` 使环解除——
+`--a` 由 `invalid` 恢复为 `1px`（胜出者交还 `p` 规则），`--b` 变为
+`missing`，`color` 由 fallback `7px` 并回主分支 `1px`；添加 `c`
+则反向形成循环。这些场景在 `/stylesheet-audit` 中同样被共享签名覆盖：
+删除会解除循环的声明（失效原因由「循环依赖」变为「var() 解析失败」）
+会以 `reason_changed` 阻断，不会进入删除批次。
 
 ### 校验（HTTP 422，不产生部分结果）
 
@@ -1357,18 +1446,24 @@ app/
                 固定 L/h/alpha 的最大色域内 C 二分查找
   cascade.py    层叠排序键与淘汰证据生成
   variables.py  var() 解析替换、自定义属性继承与循环检测
-  engine.py     计算编排（_solve 产出带完整轨迹的世界，compute 输出旧版响应）
-  preview.py    样式变更预演：补丁校验 / 基线与补丁后复算 / 留一法归因 /
-                因果依赖图最短路与 shadowed 判定
-  audit.py      样式表清理审计：样本树校验展平、逐节点签名与按序
-                贪心试删（整树重算）、首个冲突节点与阻断原因诊断
+  analysis.py   不可变整树分析内核：RuleSet 一次解析、SolveOptions 变体、
+                先序逐节点 NodeAnalysis（层叠胜出 / 候选定位 / computed /
+                custom_properties / invalid 含原因 / 继承与 var() 依赖）
+                与三入口共享的节点状态签名
+  engine.py     /compute 编排（内核求解结果渲染为旧版响应）
+  preview.py    样式变更预演：补丁校验 / 基线与补丁后复算（共享内核与签名）/
+                留一法归因 / 因果依赖图最短路与 shadowed 判定
+  audit.py      样式表清理审计：样本树校验展平、按序贪心试删（内核整树
+                重算 + 共享签名比对）、首个冲突节点与阻断原因诊断
   dom_impact.py DOM 变更影响分析：原子变更校验与应用、基线 / 变更后
-                整树重算、逐节点 computed/custom_properties/invalid
-                比对与选择器命中 / 层叠 / 继承 / var() 链归因
+                整树重算、逐节点共享签名比对与选择器命中 / 层叠 /
+                继承 / var() 链归因
 tests/test_cascade.py     /compute 端到端测试
 tests/test_preview.py     /compute 样式变更预演（patches）端到端测试
 tests/test_stylesheet_audit.py /stylesheet-audit 端到端测试
 tests/test_dom_impact.py  /dom-impact 端到端测试
+tests/test_analysis_kernel.py 整树分析内核一致性端到端测试（嵌套继承、
+                          fallback 改道、循环解除、同值换胜出者、非法输入）
 tests/test_overlap.py     /selector-overlap 端到端测试
 tests/test_keyframe.py    /keyframe-sample 端到端测试
 tests/test_counters.py    /counter-render 端到端测试

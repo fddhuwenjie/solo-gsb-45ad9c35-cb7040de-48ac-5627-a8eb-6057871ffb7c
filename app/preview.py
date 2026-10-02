@@ -5,6 +5,12 @@
 与选择器，因此两个世界中参与层叠的属性集合不变，胜出声明可以用
 (rule_index, declaration_index) 唯一比对。
 
+基线、补丁后与留一法复算都建立在整树分析内核（analysis.py）之上：规则骨架
+只解析一次（RuleSet），补丁后的声明表经 with_declarations 复用骨架；逐项
+差异与 shadowed 判定使用与 /stylesheet-audit、/dom-impact 完全相同的节点
+状态签名（胜出声明定位 + 状态 + 取值 + 失效原因），因此“胜出者改变但取值
+相同”的补丁不会被误判为未生效。
+
 归因采用留一法（leave-one-out）：逐个把某条补丁从补丁集中拿掉复算，若目标
 元素结果与全量补丁一致，则该补丁未影响结果（shadowed）；否则它对相应的
 差异负责。因果轨迹在两个世界的数据依赖并集图上做最短路：
@@ -20,12 +26,11 @@ from __future__ import annotations
 
 import heapq
 
-from .engine import _World, _solve
+from .analysis import NodeAnalysis, PropSignature, RuleSet, SolveOptions, solve_chain
 from .models import (
     ComputePreview,
     ComputePreviewResponse,
     ComputeRequest,
-    InvalidDeclOut,
     PatchRefOut,
     PreviewSnapshotOut,
     PropertyChangeOut,
@@ -36,6 +41,11 @@ from .variables import VarEvent
 
 class PatchError(ValueError):
     """补丁定位或内容非法（整次请求 422，不产生部分结果）。"""
+
+
+# 自定义属性在该侧链上不存在时的占位签名（普通属性在预演两世界中集合不变，
+# 不需要 absent 占位）
+_MISSING_SIG = PropSignature(winner=None, status="missing", value=None, reason=None)
 
 
 # ---------- 校验与应用 ----------
@@ -69,7 +79,7 @@ def _validate_patches(num_rules: int, rules, patches) -> None:
 def apply_patches(rules, patches):
     """深拷贝规则并整体应用 value / important 补丁；layer 补丁不在 Rule 上
     修改（layer 是规则级字段，而补丁按声明定位），而是返回
-    (patched_rules, layer_overrides)，由引擎按声明覆盖层。
+    (patched_rules, layer_overrides)，由内核按声明覆盖层。
 
     调用前应已通过 _validate_patches。
     """
@@ -86,45 +96,33 @@ def apply_patches(rules, patches):
     return patched, layer_overrides
 
 
-def _effective_layer(world: _World, ri: int, di: int):
-    if (ri, di) in world.layer_overrides:
-        return world.layer_overrides[(ri, di)]
-    return world.rules[ri].layer
+def _patched_view(base_ruleset: RuleSet, rules, patches):
+    """应用一组补丁，返回 (补丁后规则集, 求解变体)；规则骨架复用不重新解析。"""
+    patched_rules, layer_overrides = apply_patches(rules, patches)
+    patched_ruleset = base_ruleset.with_declarations(
+        tuple(tuple(r.declarations) for r in patched_rules)
+    )
+    return patched_ruleset, SolveOptions(layer_overrides=layer_overrides)
 
 
 # ---------- 快照与签名 ----------
 
 
-def _snapshot(world: _World) -> PreviewSnapshotOut:
+def _snapshot(world: NodeAnalysis) -> PreviewSnapshotOut:
     return PreviewSnapshotOut(
-        computed=dict(world.computed),
-        custom_properties=dict(world.custom_properties),
-        invalid=[
-            InvalidDeclOut(property=i.property, value=i.value, reason=i.reason)
-            for i in world.invalid
-        ],
+        computed=world.computed(),
+        custom_properties=world.custom_properties(),
+        invalid=world.invalid(),
     )
 
 
-def _normal_sig(world: _World, prop: str):
-    info = world.normals[prop]
-    return (info.status, info.value)
+def _normal_sig(world: NodeAnalysis, prop: str) -> PropSignature:
+    return world.normals[prop].signature()
 
 
-def _custom_sig(world: _World, name: str):
-    return world.element_custom.get(name, ("missing", None))
-
-
-def _world_signature(world: _World):
-    """目标元素最终结果签名（普通属性 + 自定义属性 + invalid 原因）。"""
-    normals = tuple(
-        sorted((p, _normal_sig(world, p)) for p in world.normals)
-    )
-    customs = tuple(
-        sorted((n, s, v) for n, (s, v) in world.element_custom.items())
-    )
-    invalids = tuple(sorted((i.property, i.reason) for i in world.invalid))
-    return normals, customs, invalids
+def _custom_sig(world: NodeAnalysis, name: str) -> PropSignature:
+    state = world.customs.get(name)
+    return state.signature() if state else _MISSING_SIG
 
 
 # ---------- 因果依赖图 ----------
@@ -138,7 +136,7 @@ def _custom_node(depth: int, name: str) -> tuple:
     return ("custom_at", depth, name)
 
 
-def _origin_of_custom(world: _World, depth: int, name: str):
+def _origin_of_custom(world: NodeAnalysis, depth: int, name: str):
     """name 在 depth 层解析值的声明来源：取不晚于 depth 的最近一层本元素胜出声明。"""
     for d in range(depth, -1, -1):
         if name in world.depths[d].winners:
@@ -146,11 +144,11 @@ def _origin_of_custom(world: _World, depth: int, name: str):
     return None
 
 
-def _is_cyclic_at(world: _World, depth: int, name: str) -> bool:
+def _is_cyclic_at(world: NodeAnalysis, depth: int, name: str) -> bool:
     return name in world.depths[depth].cyclic
 
 
-def _invalid_word(world: _World, depth: int, ref_status: str, name: str) -> str:
+def _invalid_word(world: NodeAnalysis, depth: int, ref_status: str, name: str) -> str:
     if ref_status == "missing":
         return "未定义"
     if _is_cyclic_at(world, depth, name):
@@ -159,7 +157,7 @@ def _invalid_word(world: _World, depth: int, ref_status: str, name: str) -> str:
 
 
 def _event_edges(
-    world: _World,
+    world: NodeAnalysis,
     depth: int,
     consumer: tuple,
     events: list[VarEvent],
@@ -206,7 +204,7 @@ def _event_edges(
                 )
 
 
-def _build_edges(world: _World) -> list[tuple[tuple, tuple, str]]:
+def _build_edges(world: NodeAnalysis) -> list[tuple[tuple, tuple, str]]:
     edges: list[tuple[tuple, tuple, str]] = []
     target_depth = len(world.chain) - 1
 
@@ -222,7 +220,7 @@ def _build_edges(world: _World) -> list[tuple[tuple, tuple, str]]:
             )
         # 循环失效边（环内双向，保证任一端都能被追溯到）
         for name in dinfo.cyclic:
-            self_loop = name in dinfo.deps.get(name, [])
+            self_loop = name in dinfo.deps.get(name, ())
             if self_loop:
                 label = (
                     f"{dinfo.label} 上 {name} 自引用 var({name})，"
@@ -230,7 +228,7 @@ def _build_edges(world: _World) -> list[tuple[tuple, tuple, str]]:
                 )
                 node = _custom_node(d, name)
                 edges.append((node, node, label))
-            for dep in dinfo.deps.get(name, []):
+            for dep in dinfo.deps.get(name, ()):
                 v = _origin_of_custom(world, d, dep)
                 if v is None:
                     continue
@@ -251,7 +249,7 @@ def _build_edges(world: _World) -> list[tuple[tuple, tuple, str]]:
                 continue
             if status[0] != "invalid":
                 continue
-            for ev in dinfo.events.get(name, []):
+            for ev in dinfo.events.get(name, ()):
                 for sub in ev.iter_all():
                     v = _origin_of_custom(world, d, sub.name)
                     if v is not None:
@@ -267,7 +265,7 @@ def _build_edges(world: _World) -> list[tuple[tuple, tuple, str]]:
 
     # 目标元素的继承边（本元素未声明、沿链取到祖先值）
     target_winners = world.depths[target_depth].winners if world.depths else {}
-    for name in world.element_custom:
+    for name in world.customs:
         if name in target_winners:
             continue
         origin = _origin_of_custom(world, target_depth - 1, name)
@@ -290,7 +288,7 @@ def _build_edges(world: _World) -> list[tuple[tuple, tuple, str]]:
     return edges
 
 
-def _merge_edges(baseline: _World, patched: _World):
+def _merge_edges(baseline: NodeAnalysis, patched: NodeAnalysis):
     """合并两个世界的边。返回 rev 邻接（来源 -> [(消费者, 边信息)]）与全部边信息。
 
     每条 (u, v) 边记录它在基线 / 补丁后世界中的标签集合。
@@ -398,14 +396,14 @@ def _render_hop(dst, src, slot) -> list[str]:
     return [f"【基线】{bl[0]}"]
 
 
-def _node_context(node: tuple, world: _World) -> str:
+def _node_context(node: tuple, world: NodeAnalysis) -> str:
     if node[0] == "normal":
         return f"最终普通属性 {node[1]}"
     if node[0] == "custom_at":
         _, d, name = node
         return f"{world.depths[d].label} 上的自定义属性 {name}"
     _, ri, di = node
-    prop = world.rules[ri].declarations[di].property
+    prop = world.declaration(ri, di).property
     return f"规则 {ri} 第 {di} 条声明（{prop}）"
 
 
@@ -414,10 +412,10 @@ def _build_trail(rev, baseline, patched, patch, goal) -> list[str]:
     used = _search_trail(rev, start, goal)
     if used is None:
         return []
-    before_decl = baseline.rules[patch.rule_index].declarations[patch.declaration_index]
-    after_decl = patched.rules[patch.rule_index].declarations[patch.declaration_index]
-    before_layer = _effective_layer(baseline, patch.rule_index, patch.declaration_index)
-    after_layer = _effective_layer(patched, patch.rule_index, patch.declaration_index)
+    before_decl = baseline.declaration(patch.rule_index, patch.declaration_index)
+    after_decl = patched.declaration(patch.rule_index, patch.declaration_index)
+    before_layer = baseline.effective_layer(patch.rule_index, patch.declaration_index)
+    after_layer = patched.effective_layer(patch.rule_index, patch.declaration_index)
     changes = []
     if before_decl.value != after_decl.value:
         changes.append(f"value {before_decl.value!r} → {after_decl.value!r}")
@@ -467,11 +465,7 @@ def _winner_handoff_lines(rev, patched, goal, used):
 # ---------- 差异构建 ----------
 
 
-def _winner_loc(winner) -> tuple[int, int]:
-    return (winner.rule_index, winner.decl_index)
-
-
-def _same_winner_kind(patched_rules, loc, patches):
+def _same_winner_kind(patched: NodeAnalysis, loc, patches):
     """胜出声明不变时区分 edited / var_changed：
 
     - edited：补丁直接把胜出声明的 value 改为不含 var() 的字面值，
@@ -483,7 +477,7 @@ def _same_winner_kind(patched_rules, loc, patches):
         (p for p in patches if (p.rule_index, p.declaration_index) == loc),
         None,
     )
-    decl = patched_rules[loc[0]].declarations[loc[1]]
+    decl = patched.declaration(loc[0], loc[1])
     if (
         patch_at_loc is not None
         and "value" in patch_at_loc.model_fields_set
@@ -494,26 +488,24 @@ def _same_winner_kind(patched_rules, loc, patches):
 
 
 def _normal_changes(
-    baseline: _World,
-    patched: _World,
-    patched_rules,
+    baseline: NodeAnalysis,
+    patched: NodeAnalysis,
     patches,
     loo_worlds,
     rev,
 ) -> list[PropertyChangeOut]:
     changes = []
-    invalid_map_b = {i.property: i.reason for i in baseline.invalid}
-    invalid_map_p = {i.property: i.reason for i in patched.invalid}
     for prop in sorted(baseline.normals):
         b, a = baseline.normals[prop], patched.normals[prop]
-        loc_b, loc_a = _winner_loc(b.winner), _winner_loc(a.winner)
-        winner_changed = loc_b != loc_a
-        if not winner_changed and (b.status, b.value) == (a.status, a.value):
+        sig_b, sig_a = b.signature(), a.signature()
+        # 与审计 / DOM 变更同一签名：胜出定位 + 状态 + 取值 + 失效原因
+        if sig_b == sig_a:
             continue
+        winner_changed = sig_b.winner != sig_a.winner
         if winner_changed:
             kind = "winner_changed"
         else:
-            kind = _same_winner_kind(patched.rules, loc_a, patches)
+            kind = _same_winner_kind(patched, sig_a.winner, patches)
         responsible = [
             i
             for i, w in enumerate(loo_worlds)
@@ -538,8 +530,8 @@ def _normal_changes(
                 after_value=a.value,
                 before_winner=b.winner.to_out(),
                 after_winner=a.winner.to_out(),
-                before_reason=invalid_map_b.get(prop),
-                after_reason=invalid_map_p.get(prop),
+                before_reason=b.reason,
+                after_reason=a.reason,
                 responsible_patches=[
                     PatchRefOut(
                         index=i,
@@ -555,35 +547,32 @@ def _normal_changes(
 
 
 def _custom_changes(
-    baseline: _World,
-    patched: _World,
-    patched_rules,
+    baseline: NodeAnalysis,
+    patched: NodeAnalysis,
     patches,
     loo_worlds,
     rev,
 ) -> list[PropertyChangeOut]:
     changes = []
-    names = sorted(set(baseline.element_custom) | set(patched.element_custom))
+    names = sorted(set(baseline.customs) | set(patched.customs))
     target_depth = len(baseline.chain) - 1
     for name in names:
-        sb, vb = _custom_sig(baseline, name)
-        sa, va = _custom_sig(patched, name)
-        wb_tuple = baseline.custom_winners.get(name)
-        wa_tuple = patched.custom_winners.get(name)
-        wb = wb_tuple[0] if wb_tuple else None
-        wa = wa_tuple[0] if wa_tuple else None
-        loc_b = _winner_loc(wb) if wb else None
-        loc_a = _winner_loc(wa) if wa else None
-        winner_changed = loc_b != loc_a
-        if not winner_changed and (sb, vb) == (sa, va):
+        sig_b = _custom_sig(baseline, name)
+        sig_a = _custom_sig(patched, name)
+        if sig_b == sig_a:
             continue
+        state_b = baseline.customs.get(name)
+        state_a = patched.customs.get(name)
+        wb = state_b.winner if state_b else None
+        wa = state_a.winner if state_a else None
+        winner_changed = sig_b.winner != sig_a.winner
         if winner_changed:
             kind = "winner_changed"
-        elif loc_a is None:
+        elif sig_a.winner is None:
             # 纯继承的自定义属性，本元素无胜出声明，变化必来自变量链
             kind = "var_changed"
         else:
-            kind = _same_winner_kind(patched_rules, loc_a, patches)
+            kind = _same_winner_kind(patched, sig_a.winner, patches)
         responsible = [
             i
             for i, w in enumerate(loo_worlds)
@@ -601,11 +590,11 @@ def _custom_changes(
                 property=name,
                 kind=kind,
                 is_custom=True,
-                status_changed=sb != sa,
-                before_status=sb,
-                after_status=sa,
-                before_value=vb,
-                after_value=va,
+                status_changed=sig_b.status != sig_a.status,
+                before_status=sig_b.status,
+                after_status=sig_a.status,
+                before_value=sig_b.value,
+                after_value=sig_a.value,
                 before_winner=wb.to_out() if wb else None,
                 after_winner=wa.to_out() if wa else None,
                 responsible_patches=[
@@ -622,7 +611,7 @@ def _custom_changes(
     return changes
 
 
-def _declaration_is_candidate(world: _World, ri: int, di: int, is_custom: bool) -> bool:
+def _declaration_is_candidate(world: NodeAnalysis, ri: int, di: int, is_custom: bool) -> bool:
     """该声明是否在某元素的层叠候选集合中（胜出或落选）。"""
     pools = [d.winners for d in world.depths] if is_custom else []
     if not is_custom:
@@ -642,7 +631,7 @@ def _declaration_is_candidate(world: _World, ri: int, di: int, is_custom: bool) 
     return False
 
 
-def _declaration_wins_relevant(world: _World, ri: int, di: int, is_custom: bool) -> bool:
+def _declaration_wins_relevant(world: NodeAnalysis, ri: int, di: int, is_custom: bool) -> bool:
     """该声明是否在决定目标结果的位置胜出：普通属性看目标元素；自定义属性
     看它是否在链上任一层胜出（中间层胜出后被更深层覆盖也算“曾经胜出”）。"""
     if is_custom:
@@ -657,9 +646,9 @@ def _declaration_wins_relevant(world: _World, ri: int, di: int, is_custom: bool)
     )
 
 
-def _shadowed_reason(patch, baseline: _World, patched: _World) -> str:
+def _shadowed_reason(patch, baseline: NodeAnalysis, patched: NodeAnalysis) -> str:
     ri, di = patch.rule_index, patch.declaration_index
-    is_custom = patched.rules[ri].declarations[di].property.startswith("--")
+    is_custom = patched.declaration(ri, di).property.startswith("--")
     candidate = (
         _declaration_is_candidate(baseline, ri, di, is_custom)
         or _declaration_is_candidate(patched, ri, di, is_custom)
@@ -690,30 +679,32 @@ def _shadowed_reason(patch, baseline: _World, patched: _World) -> str:
 def compute_with_preview(req: ComputeRequest) -> ComputePreviewResponse:
     patches = req.patches
     _validate_patches(len(req.rules), req.rules, patches)
-    patched_rules, layer_overrides = apply_patches(req.rules, patches)
 
-    baseline = _solve(req.element, req.ancestors, req.layers, req.rules)
-    patched = _solve(
-        req.element, req.ancestors, req.layers, patched_rules, layer_overrides
-    )
+    # 规则骨架只解析一次；基线 / 补丁后 / 留一法复算共享同一 RuleSet 骨架
+    base_ruleset = RuleSet.build(req.rules, req.layers)
+    baseline = solve_chain(base_ruleset, req.element, req.ancestors)
+
+    patched_ruleset, patched_options = _patched_view(base_ruleset, req.rules, patches)
+    patched = solve_chain(patched_ruleset, req.element, req.ancestors, patched_options)
+
     loo_worlds = []
     for i in range(len(patches)):
-        loo_rules, loo_overrides = apply_patches(
-            req.rules, [p for j, p in enumerate(patches) if j != i]
+        loo_ruleset, loo_options = _patched_view(
+            base_ruleset, req.rules, [p for j, p in enumerate(patches) if j != i]
         )
         loo_worlds.append(
-            _solve(req.element, req.ancestors, req.layers, loo_rules, loo_overrides)
+            solve_chain(loo_ruleset, req.element, req.ancestors, loo_options)
         )
 
     rev, _combined = _merge_edges(baseline, patched)
 
-    changes = _normal_changes(baseline, patched, patched_rules, patches, loo_worlds, rev)
-    changes += _custom_changes(baseline, patched, patched_rules, patches, loo_worlds, rev)
+    changes = _normal_changes(baseline, patched, patches, loo_worlds, rev)
+    changes += _custom_changes(baseline, patched, patches, loo_worlds, rev)
     changes.sort(key=lambda c: c.property)
 
-    patched_sig = _world_signature(patched)
+    patched_sig = patched.signature()
     shadowed_idx = [
-        i for i, w in enumerate(loo_worlds) if _world_signature(w) == patched_sig
+        i for i, w in enumerate(loo_worlds) if w.signature() == patched_sig
     ]
     shadowed = [
         ShadowedPatchOut(
@@ -738,10 +729,10 @@ def compute_with_preview(req: ComputeRequest) -> ComputePreviewResponse:
         ],
     )
     return ComputePreviewResponse(
-        computed=baseline.computed,
-        custom_properties=baseline.custom_properties,
-        invalid=baseline.invalid,
-        evidence=baseline.evidence,
-        custom_property_trace=baseline.custom_trace,
+        computed=baseline.computed(),
+        custom_properties=baseline.custom_properties(),
+        invalid=baseline.invalid(),
+        evidence=baseline.evidence(),
+        custom_property_trace=baseline.custom_trace(),
         preview=preview,
     )
